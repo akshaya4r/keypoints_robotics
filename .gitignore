@@ -1,0 +1,15 @@
+# data and outputs
+*.mp4
+*.mov
+*.avi
+*.parquet
+hand_out/
+test_output/
+models/
+*.task
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store

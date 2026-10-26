@@ -1,0 +1,6 @@
+mediapipe>=0.10.14
+opencv-python
+numpy
+pandas
+pyarrow
+matplotlib
