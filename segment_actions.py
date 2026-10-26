@@ -60,6 +60,13 @@ def load(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
 
 
+def infer_fps(df: pd.DataFrame) -> float:
+    """Frame rate from frame index vs. (integer-rounded) timestamps over the whole clip."""
+    f0, f1 = df["frame"].min(), df["frame"].max()
+    t0, t1 = df["t_ms"].min(), df["t_ms"].max()
+    return 1000.0 * (f1 - f0) / (t1 - t0) if t1 > t0 else 30.0
+
+
 def hands_as_arrays(df: pd.DataFrame):
     """One entry per detected hand instance: keys table, pixel (N,21,2), world (N,21,3)."""
     df = df.sort_values(["frame", "hand_idx", "kp"])
@@ -145,7 +152,9 @@ def frame_features(keys, px, w, chosen: dict[int, int], n_frames: int,
 
     # wrist speed in palm lengths per second, from lightly smoothed positions
     xy = F[["wrist_x", "wrist_y"]].rolling(max(int(0.1 * fps), 1), center=True, min_periods=1).mean()
-    F["speed"] = np.hypot(xy.wrist_x.diff(), xy.wrist_y.diff()) * fps
+    speed = np.hypot(xy.wrist_x.diff(), xy.wrist_y.diff()) * fps
+    # spikes are usually track jumps (e.g. to another person's hand), not motion
+    F["speed"] = speed.clip(upper=speed.quantile(0.99))
     F["t_s"] = F.index / fps
     return F
 
@@ -399,7 +408,7 @@ def main() -> None:
     args = ap.parse_args()
 
     df = load(args.table)
-    fps = 1000.0 / np.median(np.diff(np.sort(df["t_ms"].unique())))
+    fps = infer_fps(df)
     n_frames = int(df["frame"].max()) + 1
     out = args.out or args.table.parent
     out.mkdir(parents=True, exist_ok=True)

@@ -39,6 +39,13 @@ def kp_xyz(w: pd.DataFrame, kp: int) -> np.ndarray:
     return np.stack([w[("wx", kp)], w[("wy", kp)], w[("wz", kp)]], axis=1)
 
 
+def infer_fps(df: pd.DataFrame) -> float:
+    """Frame rate from frame index vs. (integer-rounded) timestamps over the whole clip."""
+    f0, f1 = df["frame"].min(), df["frame"].max()
+    t0, t1 = df["t_ms"].min(), df["t_ms"].max()
+    return 1000.0 * (f1 - f0) / (t1 - t0) if t1 > t0 else 30.0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("table", type=Path)
@@ -47,7 +54,7 @@ def main() -> None:
     args = ap.parse_args()
 
     df = load(args.table)
-    fps = args.fps or 1000.0 / np.median(np.diff(np.sort(df["t_ms"].unique())))
+    fps = args.fps or infer_fps(df)
     n_frames = int(df["frame"].max()) + 1
     t = np.arange(n_frames) / fps
     stem = args.table.with_suffix("")
