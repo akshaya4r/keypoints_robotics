@@ -17,6 +17,14 @@ Usage:
   python hand_keypoints.py ego.mp4 side.mp4 --out out/ --gpu --smooth --side-by-side
   python hand_keypoints.py stereo_ego.mp4 --view left --smooth
 
+Inference metrics (no ground truth needed) are written per video:
+  <stem>_metrics.json       speed (per-frame read / preprocess / inference latency,
+                            throughput, real-time factor, per-stage wall time) and
+                            resources (process CPU % and RSS memory, sampled in the
+                            background; per stage). Needs `psutil` for CPU/memory
+                            sampling; without it only peak memory is reported.
+  <stem>_frame_timing.csv   one row per frame: read_ms, prep_ms, infer_ms, n_hands
+
 Columns in <stem>_keypoints.parquet:
   video, frame, t_ms, hand_idx, handedness, handedness_score, label_fixed,
   kp, kp_name, x_px, y_px, z_rel, wx, wy, wz
@@ -30,7 +38,13 @@ Columns in <stem>_keypoints.parquet:
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
+import platform
+import sys
+import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -40,6 +54,11 @@ import numpy as np
 import pandas as pd
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
+
+try:
+    import psutil
+except ImportError:  # metrics still work, minus CPU/memory sampling
+    psutil = None
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -80,6 +99,134 @@ def crop_view(frame: np.ndarray, view: str) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+# Metrics
+# --------------------------------------------------------------------------- #
+class ResourceMonitor:
+    """Samples this process's CPU % and resident memory in a background thread.
+
+    CPU % is psutil's per-process value: 100 % = one fully used core, so it can
+    exceed 100 on multi-core machines. `stage` tags each sample with the
+    pipeline stage that was running.
+    """
+
+    def __init__(self, interval_s: float = 0.25):
+        self.interval_s = interval_s
+        self.samples: list[tuple[float, str, float, float]] = []
+        self.stage = "init"
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        if psutil is not None:
+            self._proc = psutil.Process()
+            self._proc.cpu_percent(None)  # prime the counter
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _run(self):
+        while not self._stop.wait(self.interval_s):
+            self.samples.append((time.perf_counter(), self.stage,
+                                 self._proc.cpu_percent(None),
+                                 self._proc.memory_info().rss / 2**20))
+
+    def summary(self) -> dict:
+        out = {"available": psutil is not None, "peak_rss_mb_os": peak_rss_mb()}
+        if psutil is None or not self.samples:
+            return out
+        df = pd.DataFrame(self.samples, columns=["t", "stage", "cpu_pct", "rss_mb"])
+        n_cores = psutil.cpu_count(logical=True) or 1
+
+        def _agg(g):
+            return {
+                "cpu_pct_mean": round(g.cpu_pct.mean(), 1),
+                "cpu_pct_peak": round(g.cpu_pct.max(), 1),
+                "cpu_cores_used_mean": round(g.cpu_pct.mean() / 100, 2),
+                "rss_mb_mean": round(g.rss_mb.mean(), 1),
+                "rss_mb_peak": round(g.rss_mb.max(), 1),
+                "n_samples": int(len(g)),
+            }
+
+        out.update({
+            "logical_cores": n_cores,
+            "system_memory_gb": round(psutil.virtual_memory().total / 2**30, 1),
+            "overall": _agg(df),
+            "by_stage": {st: _agg(g) for st, g in df.groupby("stage", sort=False)},
+        })
+        return out
+
+
+def peak_rss_mb() -> float | None:
+    try:
+        import resource
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(r / 2**20 if sys.platform == "darwin" else r / 2**10, 1)  # bytes vs KiB
+    except Exception:
+        return None
+
+
+def latency_stats(x: np.ndarray) -> dict:
+    x = np.asarray(x, dtype=float)
+    if x.size == 0:
+        return {}
+    return {
+        "mean_ms": round(float(x.mean()), 2),
+        "median_ms": round(float(np.median(x)), 2),
+        "p95_ms": round(float(np.percentile(x, 95)), 2),
+        "p99_ms": round(float(np.percentile(x, 99)), 2),
+        "max_ms": round(float(x.max()), 2),
+        "std_ms": round(float(x.std()), 2),
+    }
+
+
+def speed_summary(timing: pd.DataFrame, video_fps: float, warmup: int = 10) -> dict:
+    """Per-frame latency stats; the first `warmup` frames are reported separately."""
+    steady = timing.iloc[warmup:] if len(timing) > warmup else timing
+    total = steady.read_ms + steady.prep_ms + steady.infer_ms
+    fps_infer = 1000.0 / steady.infer_ms.mean() if len(steady) else float("nan")
+    fps_e2e = 1000.0 / total.mean() if len(steady) else float("nan")
+    return {
+        "frames": int(len(timing)),
+        "warmup_frames_excluded": int(min(warmup, len(timing))),
+        "first_frame_infer_ms": round(float(timing.infer_ms.iloc[0]), 2) if len(timing) else None,
+        "read_decode": latency_stats(steady.read_ms),
+        "preprocess": latency_stats(steady.prep_ms),
+        "inference": latency_stats(steady.infer_ms),
+        "end_to_end_per_frame": latency_stats(total),
+        # MediaPipe re-runs the palm detector when tracking is lost, so latency
+        # depends on how many hands are being tracked.
+        "inference_by_n_hands": {
+            str(n): {**latency_stats(g.infer_ms), "frames": int(len(g))}
+            for n, g in steady.groupby("n_hands")
+        },
+        "throughput_fps_inference_only": round(fps_infer, 1),
+        "throughput_fps_end_to_end": round(fps_e2e, 1),
+        "real_time_factor": round(fps_e2e / video_fps, 2) if video_fps else None,
+    }
+
+
+def system_info(delegate: str) -> dict:
+    info = {
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor() or None,
+        "python": platform.python_version(),
+        "mediapipe": getattr(mp, "__version__", None),
+        "opencv": cv2.__version__,
+        "delegate": delegate,
+        "logical_cores": os.cpu_count(),
+    }
+    if psutil is not None:
+        info["physical_cores"] = psutil.cpu_count(logical=False)
+    return info
+
+
+# --------------------------------------------------------------------------- #
 # Model / landmarker
 # --------------------------------------------------------------------------- #
 def ensure_model(path: Path) -> Path:
@@ -91,7 +238,7 @@ def ensure_model(path: Path) -> Path:
 
 
 def make_landmarker(model_path: Path, use_gpu: bool, num_hands: int,
-                    det_conf: float, track_conf: float) -> vision.HandLandmarker:
+                    det_conf: float, track_conf: float) -> tuple[vision.HandLandmarker, str]:
     def _create(delegate):
         opts = vision.HandLandmarkerOptions(
             base_options=mp_tasks.BaseOptions(
@@ -108,16 +255,17 @@ def make_landmarker(model_path: Path, use_gpu: bool, num_hands: int,
         try:
             lm = _create(mp_tasks.BaseOptions.Delegate.GPU)
             print("Using GPU delegate")
-            return lm
+            return lm, "GPU"
         except Exception as e:  # GPU delegate is platform-dependent
             print(f"GPU delegate unavailable ({e.__class__.__name__}: {e}); falling back to CPU")
-    return _create(mp_tasks.BaseOptions.Delegate.CPU)
+    return _create(mp_tasks.BaseOptions.Delegate.CPU), "CPU"
 
 
 # --------------------------------------------------------------------------- #
 # 1. Detection
 # --------------------------------------------------------------------------- #
-def detect(video_path: Path, model_path: Path, args) -> tuple[pd.DataFrame, dict]:
+def detect(video_path: Path, model_path: Path, args
+           ) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open {video_path}")
@@ -130,21 +278,31 @@ def detect(video_path: Path, model_path: Path, args) -> tuple[pd.DataFrame, dict
     meta = {"fps": fps, "W": W, "H": H, "n_frames": n_total, "view": args.view}
 
     swap = {"Left": "Right", "Right": "Left"}
-    rows = []
-    lm = make_landmarker(model_path, args.gpu, args.num_hands, args.det_conf, args.track_conf)
+    rows, timing = [], []
+    t_load = time.perf_counter()
+    lm, delegate = make_landmarker(model_path, args.gpu, args.num_hands,
+                                   args.det_conf, args.track_conf)
+    meta["model_load_ms"] = round((time.perf_counter() - t_load) * 1000, 1)
+    meta["delegate"] = delegate
     try:
         i = 0
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
             if args.max_frames and i >= args.max_frames:
+                break
+            t0 = time.perf_counter()
+            ok, frame = cap.read()
+            t1 = time.perf_counter()
+            if not ok:
                 break
             rgb = cv2.cvtColor(np.ascontiguousarray(crop_view(frame, args.view)),
                                cv2.COLOR_BGR2RGB)
             img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            t2 = time.perf_counter()
             t_ms = int(round(i * 1000.0 / fps))
             res = lm.detect_for_video(img, t_ms)
+            t3 = time.perf_counter()
+            timing.append((i, (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3,
+                           len(res.hand_landmarks)))
 
             # Handedness labels for this frame (optionally flipped).
             labels, scores = [], []
@@ -172,7 +330,8 @@ def detect(video_path: Path, model_path: Path, args) -> tuple[pd.DataFrame, dict
     finally:
         lm.close()
         cap.release()
-    return pd.DataFrame(rows, columns=COLUMNS), meta
+    timing_df = pd.DataFrame(timing, columns=["frame", "read_ms", "prep_ms", "infer_ms", "n_hands"])
+    return pd.DataFrame(rows, columns=COLUMNS), meta, timing_df
 
 
 # --------------------------------------------------------------------------- #
@@ -339,20 +498,59 @@ def main() -> None:
 
     annotated = []
     for vp in args.videos:
-        print(f"[{vp.name}] detecting")
-        df, meta = detect(vp, model_path, args)
-        cover = df.groupby("handedness")["frame"].nunique() / max(meta["n_frames"], 1)
-        print(f"[{vp.name}] {meta['n_frames']} frames @ {meta['fps']:.1f} fps; "
-              f"coverage: {cover.round(3).to_dict()}")
-        if args.smooth:
-            print(f"[{vp.name}] smoothing")
-            df = smooth(df, meta["W"], args.min_cutoff, args.beta)
-        table = save_table(df, args.out / f"{vp.stem}_keypoints")
-        out_vid = args.out / f"{vp.stem}_annotated.mp4"
-        print(f"[{vp.name}] rendering -> {out_vid}")
-        render(vp, df, meta, out_vid)
+        stage_s = {}
+        with ResourceMonitor() as mon:
+            print(f"[{vp.name}] detecting")
+            mon.stage = "detect"
+            t = time.perf_counter()
+            df, meta, timing = detect(vp, model_path, args)
+            stage_s["detect"] = time.perf_counter() - t
+            cover = df.groupby("handedness")["frame"].nunique() / max(meta["n_frames"], 1)
+            print(f"[{vp.name}] {meta['n_frames']} frames @ {meta['fps']:.1f} fps; "
+                  f"coverage: {cover.round(3).to_dict()}")
+            if args.smooth:
+                print(f"[{vp.name}] smoothing")
+                mon.stage = "smooth"
+                t = time.perf_counter()
+                df = smooth(df, meta["W"], args.min_cutoff, args.beta)
+                stage_s["smooth"] = time.perf_counter() - t
+            mon.stage = "save"
+            t = time.perf_counter()
+            table = save_table(df, args.out / f"{vp.stem}_keypoints")
+            stage_s["save"] = time.perf_counter() - t
+            out_vid = args.out / f"{vp.stem}_annotated.mp4"
+            print(f"[{vp.name}] rendering -> {out_vid}")
+            mon.stage = "render"
+            t = time.perf_counter()
+            render(vp, df, meta, out_vid)
+            stage_s["render"] = time.perf_counter() - t
         annotated.append(out_vid)
         print(f"[{vp.name}] keypoints -> {table}")
+
+        speed = speed_summary(timing, meta["fps"])
+        metrics = {
+            "video": {"file": vp.name, "fps": meta["fps"], "frames": meta["n_frames"],
+                      "processed_resolution": [meta["W"], meta["H"]], "view": meta["view"],
+                      "duration_s": round(meta["n_frames"] / meta["fps"], 2)},
+            "settings": {"num_hands": args.num_hands, "det_conf": args.det_conf,
+                         "track_conf": args.track_conf, "smooth": args.smooth,
+                         "model": str(model_path)},
+            "system": system_info(meta["delegate"]),
+            "model_load_ms": meta["model_load_ms"],
+            "speed": speed,
+            "stage_wall_time_s": {k: round(v, 2) for k, v in stage_s.items()},
+            "resources": mon.summary(),
+        }
+        mpath = args.out / f"{vp.stem}_metrics.json"
+        mpath.write_text(json.dumps(metrics, indent=2))
+        timing.to_csv(args.out / f"{vp.stem}_frame_timing.csv", index=False)
+        inf = speed["inference"]
+        res = metrics["resources"].get("by_stage", {}).get("detect", {})
+        print(f"[{vp.name}] inference {inf.get('mean_ms')} ms mean / {inf.get('p95_ms')} ms p95; "
+              f"end-to-end {speed['throughput_fps_end_to_end']} fps "
+              f"({speed['real_time_factor']}x real time); "
+              f"CPU {res.get('cpu_pct_mean', 'n/a')} % mean; "
+              f"peak RSS {metrics['resources']['peak_rss_mb_os']} MB -> {mpath}")
 
     if args.side_by_side and len(annotated) >= 2:
         sbs = args.out / "side_by_side.mp4"

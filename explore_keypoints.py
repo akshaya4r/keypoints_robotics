@@ -9,6 +9,8 @@ Plots (saved next to the table):
   - pinch aperture: thumb tip <-> index tip distance (mm, world coords)
   - hand openness: mean fingertip-to-wrist distance (mm, world coords)
   - wrist trajectory in the image, coloured by time
+  - per-frame latency over time, if <stem>_frame_timing.csv from
+    hand_keypoints.py sits next to the table
 """
 from __future__ import annotations
 
@@ -95,6 +97,28 @@ def main() -> None:
     fig2.savefig(f"{stem}_wrist_traj.png", dpi=130)
 
     print(f"saved {stem}_timeseries.png and {stem}_wrist_traj.png")
+
+    timing_path = Path(str(stem).removesuffix("_keypoints") + "_frame_timing.csv")
+    if timing_path.exists():
+        tm = pd.read_csv(timing_path)
+        fig3, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True,
+                                gridspec_kw={"height_ratios": [3, 1]})
+        tt = tm.frame / fps
+        for col, c in [("read_ms", "tab:gray"), ("prep_ms", "tab:green"), ("infer_ms", "tab:red")]:
+            ax[0].plot(tt, tm[col], lw=0.6, color=c, label=col.removesuffix("_ms"))
+        ax[0].axhline(1000 / fps, color="k", ls="--", lw=0.8, label="real-time budget")
+        ax[0].set_ylabel("latency [ms]")
+        ax[0].set_yscale("log")
+        ax[0].legend(loc="upper right", ncol=4)
+        ax[0].grid(alpha=0.3)
+        ax[1].step(tt, tm.n_hands, where="post", color="tab:purple")
+        ax[1].set_ylabel("hands")
+        ax[1].set_xlabel("time [s]")
+        ax[1].grid(alpha=0.3)
+        fig3.suptitle(f"Per-frame latency - {timing_path.name}")
+        fig3.tight_layout()
+        fig3.savefig(f"{stem}_latency.png", dpi=130)
+        print(f"saved {stem}_latency.png")
     if args.show:
         plt.show()
 

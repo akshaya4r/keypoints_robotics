@@ -4,3 +4,5 @@ numpy
 pandas
 pyarrow
 matplotlib
+scikit-learn
+psutil
